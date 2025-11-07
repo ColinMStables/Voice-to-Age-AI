@@ -1,0 +1,5 @@
+*.pyc
+__pycache__/
+
+cv-corpus-23.0-2025-09-05/
+mcv-scripted-en-v23.0.tar.gz
