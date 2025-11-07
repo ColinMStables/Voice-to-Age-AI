@@ -85,7 +85,6 @@ def plot_real_time_voice():
         stream.stop()
         stream.close()
         plt.ioff()
-        plt.show()
 
 class RTVoice():
 
