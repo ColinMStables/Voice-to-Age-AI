@@ -5,7 +5,7 @@ Processes the mcv dataset into the mel spectrograms
 """
 
 import csv
-import pandas as pd
+import torchaudio as ta
 
 PATH = "./cv-corpus-23.0-2025-09-05/en/"
 
@@ -37,6 +37,14 @@ class DatasetProcessing():
                         number_of_age[row[7]] += 1
 
         print(number_of_age)
+
+    def convert_file_to_mel_spec(self,
+                                 file
+                                 ):
+        waveform, sample_rate = ta.load(file, normalize=True)
+        transform = ta.transforms.MelSpectrogram(sample_rate)
+        mel_spec = transform(waveform)
+        print(mel_spec)
 
 
 d = DatasetProcessing(PATH)
