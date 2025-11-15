@@ -155,27 +155,22 @@ class VoiceData(Dataset):
             self.files_by_class[cls] = cls_files
 
         # Since the dataset is very skewed towards twenties we sample all the other classes until it matches its size
-        if(self.training):
-            max_count = max(len(files) for files in self.files_by_class.values())
-            self.balanced_files = []
-            for cls, files in self.files_by_class.items():
-                sampled_files = random.choices(files, k=max_count)
-                self.balanced_files.extend(sampled_files)
+        max_count = max(len(files) for files in self.files_by_class.values())
+        self.balanced_files = []
+        for cls, files in self.files_by_class.items():
+            sampled_files = random.choices(files, k=max_count)
+            self.balanced_files.extend(sampled_files)
 
-            random.shuffle(self.balanced_files)
+        random.shuffle(self.balanced_files)
 
-            self.freq_mask = T.FrequencyMasking(freq_mask_param=10)
-            self.time_mask = T.TimeMasking(time_mask_param=20)
-        else:
-            self.balanced_files = self.files_by_class
+        self.freq_mask = T.FrequencyMasking(freq_mask_param=10)
+        self.time_mask = T.TimeMasking(time_mask_param=20)
 
     
     def __getitem__(self, idx):
 
-        if(self.training):
-            file_path = self.balanced_files[idx]
-        else:
-            file_path = self.files_by_class[self.idx_to_class[idx]]
+        file_path = self.balanced_files[idx]
+
         with open(file_path, "rb") as f:
             mel = pickle.load(f)
 
@@ -198,10 +193,8 @@ class VoiceData(Dataset):
         return mel, label
 
     def __len__(self):
-        if(self.training):
-            return len(self.balanced_files)
-        else:
-            return 0
+        return len(self.balanced_files)
+
     
 """
 
