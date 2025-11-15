@@ -125,14 +125,14 @@ class VoiceData(Dataset):
     """
 
     def __init__(self,
-                 root_dir
+                 root_dir,
+                 training = True
                  ) -> None:
         super().__init__()
         self.root_dir = root_dir
 
+        self.training = training
         self.root_dir = root_dir
-
-        self.training = False
 
         class_names = sorted(os.listdir(root_dir))
         self.class_to_idx = {"teens" : 0,
@@ -292,7 +292,7 @@ def test_network(network, progress, max_accuracy, ii, loss, phase_num):
     """
     network.eval()
     test_batch_size = TEST_BATCH_SIZE
-    test_dataset = VoiceData(PATH + "test")
+    test_dataset = VoiceData(PATH + "test", False)
     test_dataset.training = False
     test_dataloader = DataLoader(test_dataset, test_batch_size, False, generator=torch.Generator(device="cuda"), collate_fn= lambda x : collate_fn(x))
     correct = 0
@@ -427,7 +427,7 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
         # Optimizer for this phase
         optimizer = build_optimizer(model, 1)
 
-        dataset = VoiceData(PATH + "train")
+        dataset = VoiceData(PATH + "train", True)
         dataset.training = True
         dataloader = DataLoader(dataset, BATCH_SIZE, True,
                                 generator=torch.Generator(device="cuda"),
@@ -482,8 +482,8 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
         
                 
 
-network = NeuralNet.Audio_Transformer(n_mels=n_mel, classes=9, d_model=128, nheads=8, N=6, frame_length=100)
-network.load_state_dict(torch.load("./Max_Accuracy_Model.pth"))
+network = NeuralNet.Audio_Transformer(n_mels=n_mel, classes=9, d_model=256, nheads=16, N=6, frame_length=100)
+#network.load_state_dict(torch.load("./Max_Accuracy_Model.pth"))
 
 print(f"Total number of parameters: {count_parameters(network, False)}")
 
