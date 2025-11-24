@@ -288,14 +288,14 @@ LR2 = 3e-4
 LR3 = 1e-5
 
 def prepare_phase_1(model):
-    freeze(model.second_finder)
-    freeze(model.conv_net)        
+    # freeze(model.second_finder)
+    unfreeze(model.conv_net)        
     unfreeze(model.encoder)
     unfreeze(model.input_embedding)
     unfreeze(model.classifier)
 
 def prepare_phase_2(model):
-    unfreeze(model.second_finder)
+    # unfreeze(model.second_finder)
 
     freeze(model.encoder)
     freeze(model.input_embedding)
@@ -303,7 +303,7 @@ def prepare_phase_2(model):
     freeze(model.conv_net)
 
 def prepare_phase_3(model):
-    unfreeze(model.second_finder)
+    # unfreeze(model.second_finder)
     unfreeze(model.encoder)
     unfreeze(model.input_embedding)
     unfreeze(model.conv_net)
@@ -470,6 +470,7 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
     plt.ion()
     fig, ax1 = plt.subplots(figsize=(10,5))
     ax2 = ax1.twinx()
+    dataset = VoiceData(PATH + "train_mfcc", True, leave_free_gb=3)
 
     for epoch in range(total_epochs):
 
@@ -485,7 +486,6 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
         # Optimizer for this phase
         optimizer = build_optimizer(model, 1)
 
-        dataset = VoiceData(PATH + "train_mfcc", True, leave_free_gb=24)
         dataset.training = True
         sampler = make_weighted_sampler(dataset)
         dataloader = DataLoader(dataset, BATCH_SIZE, sampler=sampler,
@@ -502,22 +502,21 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
         progress = ProgressBar(len(dataset) // BATCH_SIZE)
 
         for ii, batch in enumerate(dataloader):
-            network.debug = True
 
             # If we've passed the number of steps to get to the next phase we freeze/unfreeze layers and refresh the optimizer
-            if(ii > PHASE_1_Steps):
-                if(PHASE_2_not_init):
-                    PHASE_2_not_init = False
-                    prepare_phase_2(model)
-                    optimizer = build_optimizer(model, 2)
-                    phase_num = 2
+            # if(ii > PHASE_1_Steps):
+            #     if(PHASE_2_not_init):
+            #         PHASE_2_not_init = False
+            #         prepare_phase_2(model)
+            #         optimizer = build_optimizer(model, 2)
+            #         phase_num = 2
 
-            if(ii > (PHASE_2_Steps + PHASE_1_Steps)):
-                if(PHASE_3_not_init):
-                    PHASE_3_not_init = False
-                    prepare_phase_3(model)
-                    optimizer = build_optimizer(model, 3)
-                    phase_num = 3
+            # if(ii > (PHASE_2_Steps + PHASE_1_Steps)):
+            #     if(PHASE_3_not_init):
+            #         PHASE_3_not_init = False
+            #         prepare_phase_3(model)
+            #         optimizer = build_optimizer(model, 3)
+            #         phase_num = 3
 
 
             model.train()
@@ -548,7 +547,7 @@ network = NeuralNet.Audio_Transformer(n_mels=52, classes=9, d_model=64, nheads=8
 print(f"Total number of parameters: {count_parameters(network, False)}")
 print(f"Transformer number of parameters: {count_parameters(network.encoder, False)}")
 print(f"Feed in convolution number of parameters: {count_parameters(network.conv_net, False)}")
-print(f"Convolution second finder of parameters: {count_parameters(network.second_finder, False)}")
+#print(f"Convolution second finder of parameters: {count_parameters(network.second_finder, False)}")
 
 voice_data = RTVoiceData.RTVoice(n_mel=n_mel)
 

@@ -96,7 +96,7 @@ class Audio_Transformer(nn.Module):
 
         self.debug = False
 
-        self.second_finder = RL_Second_Finder(n_mel=n_mels)
+        #self.second_finder = RL_Second_Finder(n_mel=n_mels)
 
         self.conv_net = Direct_Convolution(n_mels)
 
@@ -240,22 +240,22 @@ class Audio_Transformer(nn.Module):
         """
         B, C, M, T = mel_spec.shape
  
-        sf_in = mel_spec.squeeze(1)  # (B, M, T)
+        x = mel_spec.squeeze(1)  # (B, M, T)
 
-        second = self.second_finder(sf_in)  # (B,2)
-        start_norm, duration_norm = second[:,0], second[:,1]
+        # second = self.second_finder(x)  # (B,2)
+        # start_norm, duration_norm = second[:,0], second[:,1]
 
-        # Cropping using the convolutional layer
-        cropped = self.crop_mel_spec_dual(mel_spec, start_norm, duration_norm, lengths=lengths)
+        # # Cropping using the convolutional layer
+        # cropped = self.crop_mel_spec_dual(mel_spec, start_norm, duration_norm, lengths=lengths)
 
-        if(self.debug):
-            # This plots both the mel spectrogram before and after cropping
-            self.plot_cropped_mel(sf_in, cropped)
+        # if(self.debug):
+        #     # This plots both the mel spectrogram before and after cropping
+        #     self.plot_cropped_mel(sf_in, cropped)
 
-        #convert to (B, frame_length, n_mels)
-        x = cropped.squeeze(1)
+        # #convert to (B, frame_length, n_mels)
+        # x = cropped.squeeze(1)
 
-        x = self.conv_net(sf_in)
+        x = self.conv_net(x)
 
         x = x.transpose(1,2) # (B, frame_length, n_mels)
 
@@ -268,7 +268,7 @@ class Audio_Transformer(nn.Module):
 
         pos = self.pos_embedding[:, :x.size(1), :].to(x.device)
         x = x + pos
-        
+
         x = self.pre_norm(x)
         lens = torch.full((B,), x.size(1), dtype=torch.long, device=x.device)
         x = self.encoder(x, lens)
