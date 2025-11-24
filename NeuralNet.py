@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio as ta
 
 import matplotlib.pyplot as plt
 
@@ -14,17 +15,22 @@ class RL_Second_Finder(nn.Module):
         super().__init__()
 
         self.conv = nn.Sequential(
-            nn.Conv1d(n_mel, 128, kernel_size=5, padding=2),
+            nn.Conv1d(n_mel, 128, kernel_size=3, padding=1),
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.AvgPool1d(2),
 
-            nn.Conv1d(128, 256, kernel_size=5, padding=2),
-            nn.BatchNorm1d(256),
+            nn.Conv1d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.AvgPool1d(2),
 
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+
             nn.Conv1d(256, 256, kernel_size=3, padding=1),
+            nn.AvgPool1d(2),
             nn.BatchNorm1d(256),
             nn.ReLU(),
 
@@ -54,17 +60,17 @@ class Direct_Convolution(nn.Module):
         super().__init__()
 
         self.conv = nn.Sequential(
-            nn.Conv1d(n_mel, 128, kernel_size=5, padding=2),
+            nn.Conv1d(n_mel, 128, kernel_size=5, padding=1),
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.AvgPool1d(2),
 
-            nn.Conv1d(128, 256, kernel_size=5, padding=2),
-            nn.BatchNorm1d(256),
+            nn.Conv1d(128, 128, kernel_size=5, padding=1),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.AvgPool1d(2),
 
-            nn.Conv1d(256, 256, kernel_size=3, padding=1),
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
             nn.AvgPool1d(2),
             nn.BatchNorm1d(256),
             nn.ReLU()
@@ -81,30 +87,30 @@ class Audio_Transformer(nn.Module):
                  classes=9,
                  nheads=8,
                  N=6,
-                 frame_length=100,   
-                 min_duration=0.05
+                 frame_length=100
                  ):
         super().__init__()
         self.n_mels = n_mels
         self.d_model = d_model
         self.frame_length = frame_length
-        self.min_duration = min_duration
 
         self.debug = False
 
         self.second_finder = RL_Second_Finder(n_mel=n_mels)
 
-        self.conv_net = Direct_Convolution(64)
+        self.conv_net = Direct_Convolution(n_mels)
 
         # 256 for the convolution channels #TODO make variable
         self.input_embedding = nn.Linear(256, d_model)
 
         self.max_pos = frame_length + 1 
-        self.pos_embedding = nn.Parameter(torch.randn(1, self.max_pos, d_model))
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.max_pos * 4, d_model))
 
         self.pre_norm = nn.LayerNorm(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model, nheads, batch_first=True)
-        self.encoder = nn.TransformerEncoder(encoder_layer, N)
+        # encoder_layer = nn.TransformerEncoderLayer(d_model, nheads, batch_first=True, dim_feedforward=1024)
+        # self.encoder = nn.TransformerEncoder(encoder_layer, N)
+
+        self.encoder = ta.models.Conformer(d_model, nheads, 1024, N, 3, 0.1)
 
         # Here we use the CLS token like bert for classification
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
@@ -246,10 +252,10 @@ class Audio_Transformer(nn.Module):
             # This plots both the mel spectrogram before and after cropping
             self.plot_cropped_mel(sf_in, cropped)
 
-        # convert to (B, frame_length, n_mels)
+        #convert to (B, frame_length, n_mels)
         x = cropped.squeeze(1)
 
-        x = self.conv_net(x)
+        x = self.conv_net(sf_in)
 
         x = x.transpose(1,2) # (B, frame_length, n_mels)
 
@@ -262,9 +268,11 @@ class Audio_Transformer(nn.Module):
 
         pos = self.pos_embedding[:, :x.size(1), :].to(x.device)
         x = x + pos
-
+        
         x = self.pre_norm(x)
-        x = self.encoder(x)             # (B, length+1, d)
-        cls_output = x[:, 0, :]         # (B, d)
+        lens = torch.full((B,), x.size(1), dtype=torch.long, device=x.device)
+        x = self.encoder(x, lens)
+        #x = self.encoder(x)             # (B, length+1, d)
+        cls_output = x[0][:, 0, :]         # (B, d)
         logits = self.classifier(cls_output)   # (B, classes)
         return logits
