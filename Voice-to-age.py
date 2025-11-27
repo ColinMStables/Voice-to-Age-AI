@@ -7,6 +7,7 @@ import pickle
 import os
 import random
 from torch.utils.data import Dataset
+from torch.utils.data import WeightedRandomSampler
 from torch.utils.data import DataLoader
 import torchaudio.transforms as T
 import glob
@@ -23,16 +24,17 @@ import csv
 import os
 
 import pandas as pd
+import psutil
 
 torch.set_default_device("cuda:0")
 
 PATH = "./cv-corpus-23.0-2025-09-05/en/"
-BATCH_SIZE = 1024
+BATCH_SIZE = 64
 TEST_BATCH_SIZE = 32
 EP = 1E-6
 WD = 1E-3
 
-BATCHES_PER_TEST = 20
+BATCHES_PER_TEST = 60
 
 n_mel = 64
 
@@ -63,7 +65,7 @@ class ProgressBar:
         filled_length = int(self.bar_length * fraction_done)
         bar = '#' * filled_length + '-' * (self.bar_length - filled_length)
 
-        # Estimates time left
+        # Estimates time left based on time from previous update call
         elapsed = time.time() - self.start_time
         est_total = elapsed / fraction_done if fraction_done > 0 else 0
         remaining = est_total - elapsed
@@ -119,57 +121,92 @@ def collate_fn(batch):
 
 class VoiceData(Dataset):
     """
-    
-    Uses pytorch datasets
-    
+    Pytorch dataset for testing and training models
+
+    Args:
+        root_dir : where the datset is, should be to the path provided by data_processing.py
+        training : removes the RAM cache feature if this is false
+        leave_free_gb: dataset is cached in RAM so this leaves a certain number of GB free from memory
     """
 
     def __init__(self,
                  root_dir,
-                 training = True
-                 ) -> None:
+                 training=True,
+                 leave_free_gb=3
+                 ):
         super().__init__()
-        self.root_dir = root_dir
 
-        self.training = training
         self.root_dir = root_dir
+        self.training = training
+        self.leave_free_gb = leave_free_gb
 
         class_names = sorted(os.listdir(root_dir))
-        self.class_to_idx = {"teens" : 0,
-                             "twenties" : 1,
-                             "thirties" : 2,
-                             "fourties" : 3,
-                             "fifties" : 4,
-                             "sixties" : 5,
-                             "seventies" : 6,
-                             "eighties" : 7,
-                             "nineties" : 8
-                             }
-        
-        self.idx_to_class = ["teens", "twenties", "thrities", "fourties", "fifties", "sixties", "seventies", "eighties", "nineties"]
+        self.class_to_idx = {cls: i for i, cls in enumerate(class_names)}
 
-        # We use glob to grab all of our spectrogram files
-        self.files_by_class = {}
+        # Selects all the files inside the dataset folder
+        self.files = []
         for cls in class_names:
-            cls_files = glob.glob(os.path.join(root_dir, cls, "*"))
-            self.files_by_class[cls] = cls_files
+            self.files.extend(glob.glob(os.path.join(root_dir, cls, "*")))
 
-        # Since the dataset is very skewed towards twenties we sample all the other classes until it matches its size
-        max_count = max(len(files) for files in self.files_by_class.values())
-        self.balanced_files = []
-        for cls, files in self.files_by_class.items():
-            sampled_files = random.choices(files, k=max_count)
-            self.balanced_files.extend(sampled_files)
+        random.shuffle(self.files)
 
-        random.shuffle(self.balanced_files)
+        file_sizes = [os.path.getsize(f) for f in self.files]
+
+        #
+        # Cache system
+        #
+        vm = psutil.virtual_memory()
+        free_ram = vm.available
+        reserve_bytes = self.leave_free_gb * (1024**3)
+
+        if free_ram <= reserve_bytes:
+            cache_budget = 0
+        else:
+            cache_budget = free_ram - reserve_bytes
+
+        if(training):
+            print(f"Free RAM: {free_ram/1e9:.2f} GB")
+            print(f"Reserving: {reserve_bytes/1e9:.2f} GB")
+            print(f"Cache budget: {cache_budget/1e9:.2f} GB")
+
+        cached_paths = []
+        used_bytes = 0
+
+        for path, size in zip(self.files, file_sizes):
+            if used_bytes + size > cache_budget:
+                break
+            cached_paths.append(path)
+            used_bytes += size
+
+        self.cached_paths = set(cached_paths)
+        self.disk_paths = set(self.files) - self.cached_paths
+
+        if(training):
+            print(f"Caching {len(self.cached_paths)} files "
+                f"({used_bytes/1e9:.2f} GB used).")
+            print(f"{len(self.disk_paths)} files stay on disk.")
+
+        self.ram_cache = {}
+        for path in self.cached_paths:
+            with open(path, "rb") as f:
+                self.ram_cache[path] = pickle.load(f)
 
         self.freq_mask = T.FrequencyMasking(freq_mask_param=10)
         self.time_mask = T.TimeMasking(time_mask_param=20)
 
+    def load_mel(self, path):
+        """
+        Checks to see if this is cached, if not load it into memory
+        """
+        if path in self.ram_cache:
+            return self.ram_cache[path].clone()
+        else:
+            with open(path, "rb") as f:
+                return pickle.load(f)
     
     def __getitem__(self, idx):
 
-        file_path = self.balanced_files[idx]
+        file_path = self.files[idx]
 
         with open(file_path, "rb") as f:
             mel = pickle.load(f)
@@ -177,24 +214,52 @@ class VoiceData(Dataset):
         # Avoids small values
         mel = torch.clamp(mel, min=1e-5)
 
-        mel = mel.log()
+        #mel = mel.log()
 
         if self.training:
             mel = self.freq_mask(mel.cuda())
             mel = self.time_mask(mel.cuda())
 
-        # This normalizes the spectrograms
-        mean = mel.mean()
-        std = mel.std()
-        mel = (mel - mean) / (std + 1e-6)
+        # This normalizes the spectrograms (Removed)
+        # mean = mel.mean()
+        # std = mel.std()
+        # mel = (mel - mean) / (std + 1e-6)
 
         label_name = os.path.basename(os.path.dirname(file_path))
         label = self.class_to_idx[label_name]
         return mel, label
 
     def __len__(self):
-        return len(self.balanced_files)
+        return len(self.files)
 
+
+
+def make_weighted_sampler(dataset):
+    # Count by class
+    counts = {cls: 0 for cls in dataset.class_to_idx}
+    for path in dataset.files:
+        cls = os.path.basename(os.path.dirname(path))
+        counts[cls] += 1
+    
+    # Inverse frequency
+    class_weights = {
+        cls: 1.0 / count if count > 0 else 0.0
+        for cls, count in counts.items()
+    }
+    
+    # Per-sample weights
+    sample_weights = []
+    for path in dataset.files:
+        cls = os.path.basename(os.path.dirname(path))
+        sample_weights.append(class_weights[cls])
+    
+    sample_weights = torch.tensor(sample_weights, dtype=torch.float)
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),  # same number per epoch
+        replacement=True
+    )
+    return sampler
     
 """
 
@@ -218,8 +283,8 @@ def unfreeze(module):
         p.requires_grad = True
 
 # The learning rate is different between phases
-LR1 = 3e-4
-LR2 = 1e-4
+LR1 = 3e-5
+LR2 = 3e-4
 LR3 = 1e-5
 
 def prepare_phase_1(model):
@@ -285,7 +350,7 @@ def test_network(network, progress, max_accuracy, ii, loss, phase_num):
     """
     network.eval()
     test_batch_size = TEST_BATCH_SIZE
-    test_dataset = VoiceData(PATH + "test", False)
+    test_dataset = VoiceData(PATH + "test_mfcc", False)
     test_dataset.training = False
     test_dataloader = DataLoader(test_dataset, test_batch_size, False, generator=torch.Generator(device="cuda"), collate_fn= lambda x : collate_fn(x))
     correct = 0
@@ -386,9 +451,9 @@ def plot_training(log_file, ax1, ax2):
     plt.pause(0.01)
 
 # These are how long each phase should last
-PHASE_1_Percentage = 0.3
-PHASE_2_Percentage = 0.3
-PHASE_3_Percentage = 0.4
+PHASE_1_Percentage = 0.2
+PHASE_2_Percentage = 0.2
+PHASE_3_Percentage = 0.6
 
 dataset_length = None
 
@@ -420,9 +485,10 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
         # Optimizer for this phase
         optimizer = build_optimizer(model, 1)
 
-        dataset = VoiceData(PATH + "train", True)
+        dataset = VoiceData(PATH + "train_mfcc", True, leave_free_gb=24)
         dataset.training = True
-        dataloader = DataLoader(dataset, BATCH_SIZE, True,
+        sampler = make_weighted_sampler(dataset)
+        dataloader = DataLoader(dataset, BATCH_SIZE, sampler=sampler,
                                 generator=torch.Generator(device="cuda"),
                                 collate_fn=lambda x: collate_fn(x))
         
@@ -436,6 +502,7 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
         progress = ProgressBar(len(dataset) // BATCH_SIZE)
 
         for ii, batch in enumerate(dataloader):
+            network.debug = True
 
             # If we've passed the number of steps to get to the next phase we freeze/unfreeze layers and refresh the optimizer
             if(ii > PHASE_1_Steps):
@@ -475,10 +542,13 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
         
                 
 
-network = NeuralNet.Audio_Transformer(n_mels=n_mel, classes=9, d_model=256, nheads=16, N=6, frame_length=100)
+network = NeuralNet.Audio_Transformer(n_mels=52, classes=9, d_model=64, nheads=8, N=6, frame_length=500)
 #network.load_state_dict(torch.load("./Max_Accuracy_Model.pth"))
 
 print(f"Total number of parameters: {count_parameters(network, False)}")
+print(f"Transformer number of parameters: {count_parameters(network.encoder, False)}")
+print(f"Feed in convolution number of parameters: {count_parameters(network.conv_net, False)}")
+print(f"Convolution second finder of parameters: {count_parameters(network.second_finder, False)}")
 
 voice_data = RTVoiceData.RTVoice(n_mel=n_mel)
 
