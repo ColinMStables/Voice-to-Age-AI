@@ -71,9 +71,9 @@ class Direct_Convolution(nn.Module):
             nn.AvgPool1d(2),
 
             nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.AvgPool1d(2),
             nn.BatchNorm1d(256),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.AvgPool1d(2)
          )
         
     def forward(self, x):
@@ -87,7 +87,8 @@ class Audio_Transformer(nn.Module):
                  classes=9,
                  nheads=8,
                  N=6,
-                 frame_length=100
+                 frame_length=100,
+                 classifier_d = 1024
                  ):
         super().__init__()
         self.n_mels = n_mels
@@ -110,17 +111,20 @@ class Audio_Transformer(nn.Module):
         # encoder_layer = nn.TransformerEncoderLayer(d_model, nheads, batch_first=True, dim_feedforward=1024)
         # self.encoder = nn.TransformerEncoder(encoder_layer, N)
 
-        self.encoder = ta.models.Conformer(d_model, nheads, 1024, N, 3, 0.1)
+        self.encoder = ta.models.Conformer(d_model, nheads, 1024, N, 5, 0.1, True, True)
 
         # Here we use the CLS token like bert for classification
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
 
         self.classifier = nn.Sequential(
             nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, classifier_d),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(d_model // 2, classes)
+            nn.Dropout(0.1),
+            nn.Linear(classifier_d, classifier_d //2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(classifier_d // 2, classes)
         )
 
     def crop_mel_spec_dual(self, mel_spec, left_norm, right_norm, lengths=None):
@@ -206,7 +210,6 @@ class Audio_Transformer(nn.Module):
         - The original mel spectrogram
         - The cropped spectrogram from crop_mel_spec_dual()
         
-        model: the network containing crop_mel_spec_dual()
         mel_spec: tensor of shape (B, M, T)
         left_norm, right_norm: floats in [0,1]
         """
@@ -240,22 +243,22 @@ class Audio_Transformer(nn.Module):
         """
         B, C, M, T = mel_spec.shape
  
-        sf_in = mel_spec.squeeze(1)  # (B, M, T)
+        x = mel_spec.squeeze(1)  # (B, M, T)
 
-        second = self.second_finder(sf_in)  # (B,2)
+        second = self.second_finder(x)  # (B,2)
         start_norm, duration_norm = second[:,0], second[:,1]
-
         # Cropping using the convolutional layer
+
         cropped = self.crop_mel_spec_dual(mel_spec, start_norm, duration_norm, lengths=lengths)
 
         if(self.debug):
             # This plots both the mel spectrogram before and after cropping
-            self.plot_cropped_mel(sf_in, cropped)
+            self.plot_cropped_mel(x, cropped)
 
         #convert to (B, frame_length, n_mels)
         x = cropped.squeeze(1)
 
-        x = self.conv_net(sf_in)
+        x = self.conv_net(x)
 
         x = x.transpose(1,2) # (B, frame_length, n_mels)
 
@@ -268,11 +271,14 @@ class Audio_Transformer(nn.Module):
 
         pos = self.pos_embedding[:, :x.size(1), :].to(x.device)
         x = x + pos
-        
+
         x = self.pre_norm(x)
         lens = torch.full((B,), x.size(1), dtype=torch.long, device=x.device)
         x = self.encoder(x, lens)
         #x = self.encoder(x)             # (B, length+1, d)
-        cls_output = x[0][:, 0, :]         # (B, d)
-        logits = self.classifier(cls_output)   # (B, classes)
+
+        #x = x[0][:, 0, :]
+        x = x[0].mean(dim=1)
+        logits = self.classifier(x)   # (B, classes)
+
         return logits
