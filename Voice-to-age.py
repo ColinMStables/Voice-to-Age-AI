@@ -29,12 +29,18 @@ import psutil
 torch.set_default_device("cuda:0")
 
 PATH = "./cv-corpus-23.0-2025-09-05/en/"
-BATCH_SIZE = 64
+BATCH_SIZE = 256
 TEST_BATCH_SIZE = 32
 EP = 1E-6
 WD = 1E-3
 
 BATCHES_PER_TEST = 60
+
+# There are 3 phases of training these define the three learning rates
+LR1 = 1e-5
+LR2 = 3e-4
+LR3 = 1e-5
+
 
 n_mel = 64
 
@@ -142,7 +148,7 @@ class VoiceData(Dataset):
 
         class_names = sorted(os.listdir(root_dir))
         self.class_to_idx = {cls: i for i, cls in enumerate(class_names)}
-
+        
         # Selects all the files inside the dataset folder
         self.files = []
         for cls in class_names:
@@ -150,49 +156,45 @@ class VoiceData(Dataset):
 
         random.shuffle(self.files)
 
-        file_sizes = [os.path.getsize(f) for f in self.files]
-
         #
         # Cache system
         #
-        vm = psutil.virtual_memory()
-        free_ram = vm.available
-        reserve_bytes = self.leave_free_gb * (1024**3)
-
-        if free_ram <= reserve_bytes:
-            cache_budget = 0
-        else:
-            cache_budget = free_ram - reserve_bytes
-
         if(training):
+            file_sizes = [os.path.getsize(f) for f in self.files]
+            vm = psutil.virtual_memory()
+            free_ram = vm.available
+            reserve_bytes = self.leave_free_gb * (1024**3)
+
+            if free_ram <= reserve_bytes:
+                cache_budget = 0
+            else:
+                cache_budget = free_ram - reserve_bytes
+
             print(f"Free RAM: {free_ram/1e9:.2f} GB")
             print(f"Reserving: {reserve_bytes/1e9:.2f} GB")
             print(f"Cache budget: {cache_budget/1e9:.2f} GB")
 
-        cached_paths = []
-        used_bytes = 0
+            cached_paths = []
+            used_bytes = 0
 
-        for path, size in zip(self.files, file_sizes):
-            if used_bytes + size > cache_budget:
-                break
-            cached_paths.append(path)
-            used_bytes += size
+            for path, size in zip(self.files, file_sizes):
+                if used_bytes + size > cache_budget:
+                    break
+                cached_paths.append(path)
+                used_bytes += size
 
-        self.cached_paths = set(cached_paths)
-        self.disk_paths = set(self.files) - self.cached_paths
+            self.cached_paths = set(cached_paths)
+            self.disk_paths = set(self.files) - self.cached_paths
 
-        if(training):
             print(f"Caching {len(self.cached_paths)} files "
                 f"({used_bytes/1e9:.2f} GB used).")
             print(f"{len(self.disk_paths)} files stay on disk.")
 
-        self.ram_cache = {}
-        for path in self.cached_paths:
-            with open(path, "rb") as f:
-                self.ram_cache[path] = pickle.load(f)
+            self.ram_cache = {}
+            for path in self.cached_paths:
+                with open(path, "rb") as f:
+                    self.ram_cache[path] = pickle.load(f)
 
-        self.freq_mask = T.FrequencyMasking(freq_mask_param=10)
-        self.time_mask = T.TimeMasking(time_mask_param=20)
 
     def load_mel(self, path):
         """
@@ -215,10 +217,6 @@ class VoiceData(Dataset):
         mel = torch.clamp(mel, min=1e-5)
 
         #mel = mel.log()
-
-        if self.training:
-            mel = self.freq_mask(mel.cuda())
-            mel = self.time_mask(mel.cuda())
 
         # This normalizes the spectrograms (Removed)
         # mean = mel.mean()
@@ -282,20 +280,15 @@ def unfreeze(module):
     for p in module.parameters():
         p.requires_grad = True
 
-# The learning rate is different between phases
-LR1 = 3e-5
-LR2 = 3e-4
-LR3 = 1e-5
-
 def prepare_phase_1(model):
-    # freeze(model.second_finder)
+    freeze(model.second_finder)
     unfreeze(model.conv_net)        
     unfreeze(model.encoder)
     unfreeze(model.input_embedding)
     unfreeze(model.classifier)
 
 def prepare_phase_2(model):
-    # unfreeze(model.second_finder)
+    unfreeze(model.second_finder)
 
     freeze(model.encoder)
     freeze(model.input_embedding)
@@ -303,7 +296,7 @@ def prepare_phase_2(model):
     freeze(model.conv_net)
 
 def prepare_phase_3(model):
-    # unfreeze(model.second_finder)
+    unfreeze(model.second_finder)
     unfreeze(model.encoder)
     unfreeze(model.input_embedding)
     unfreeze(model.conv_net)
@@ -350,7 +343,7 @@ def test_network(network, progress, max_accuracy, ii, loss, phase_num):
     """
     network.eval()
     test_batch_size = TEST_BATCH_SIZE
-    test_dataset = VoiceData(PATH + "test_mfcc", False)
+    test_dataset = VoiceData(PATH + "test_data", False)
     test_dataset.training = False
     test_dataloader = DataLoader(test_dataset, test_batch_size, False, generator=torch.Generator(device="cuda"), collate_fn= lambda x : collate_fn(x))
     correct = 0
@@ -384,7 +377,7 @@ def count_parameters(network, only_trainable=True):
         return sum(p.numel() for p in network.parameters())
     
     
-def save_training_log(file_path, loss, accuracy, step_increment=20):
+def save_training_log(file_path, loss, accuracy, step_increment=BATCHES_PER_TEST):
     """
     Appends training statistics to a CSV file, if the csv is filled it starts from the last step
 
@@ -467,10 +460,21 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
     max_accuracy = 0
     device = torch.device("cuda")
 
+    print("Start in debug mode? y/n")
+    ans = input()
+
     plt.ion()
     fig, ax1 = plt.subplots(figsize=(10,5))
     ax2 = ax1.twinx()
-    dataset = VoiceData(PATH + "train_mfcc", True, leave_free_gb=3)
+
+    training = True
+    
+    if(ans == "y"):
+        training = False
+        model.debug = True
+        print("Starting in debug mode")
+
+    dataset = VoiceData(PATH + "train_data", training, leave_free_gb=3)
 
     for epoch in range(total_epochs):
 
@@ -500,23 +504,23 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
             PHASE_3_not_init = True
 
         progress = ProgressBar(len(dataset) // BATCH_SIZE)
-
+        
         for ii, batch in enumerate(dataloader):
 
-            # If we've passed the number of steps to get to the next phase we freeze/unfreeze layers and refresh the optimizer
-            # if(ii > PHASE_1_Steps):
-            #     if(PHASE_2_not_init):
-            #         PHASE_2_not_init = False
-            #         prepare_phase_2(model)
-            #         optimizer = build_optimizer(model, 2)
-            #         phase_num = 2
+            #If we've passed the number of steps to get to the next phase we freeze/unfreeze layers and refresh the optimizer
+            if(ii > PHASE_1_Steps):
+                if(PHASE_2_not_init):
+                    PHASE_2_not_init = False
+                    prepare_phase_2(model)
+                    optimizer = build_optimizer(model, 2)
+                    phase_num = 2
 
-            # if(ii > (PHASE_2_Steps + PHASE_1_Steps)):
-            #     if(PHASE_3_not_init):
-            #         PHASE_3_not_init = False
-            #         prepare_phase_3(model)
-            #         optimizer = build_optimizer(model, 3)
-            #         phase_num = 3
+            if(ii > (PHASE_2_Steps + PHASE_1_Steps)):
+                if(PHASE_3_not_init):
+                    PHASE_3_not_init = False
+                    prepare_phase_3(model)
+                    optimizer = build_optimizer(model, 3)
+                    phase_num = 3
 
 
             model.train()
@@ -541,13 +545,13 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
         
                 
 
-network = NeuralNet.Audio_Transformer(n_mels=52, classes=9, d_model=64, nheads=8, N=6, frame_length=500)
-#network.load_state_dict(torch.load("./Max_Accuracy_Model.pth"))
+network = NeuralNet.Audio_Transformer(n_mels=59, classes=9, d_model=64, nheads=4, N=6, frame_length=500)
+network.load_state_dict(torch.load("./Max_Accuracy_Model.pth"))
 
 print(f"Total number of parameters: {count_parameters(network, False)}")
 print(f"Transformer number of parameters: {count_parameters(network.encoder, False)}")
 print(f"Feed in convolution number of parameters: {count_parameters(network.conv_net, False)}")
-#print(f"Convolution second finder of parameters: {count_parameters(network.second_finder, False)}")
+print(f"Convolution second finder of parameters: {count_parameters(network.second_finder, False)}")
 
 voice_data = RTVoiceData.RTVoice(n_mel=n_mel)
 
