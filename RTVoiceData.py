@@ -5,6 +5,7 @@ import numpy as np
 import time
 import matplotlib.pyplot as plt
 from collections import deque
+import time
 
 import NeuralNet
 
@@ -15,6 +16,8 @@ N_MELS = 64
 
 BUFFER_SIZE = int(SAMPLE_RATE * BUFFER_DURATION)
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
+
+torch.set_default_device('cuda' if torch.cuda.is_available() else 'cpu')
 
 classes = ['eighties', 'fifties', 'fourties', 'nineties', 'seventies', 'sixties', 'teens', 'thirties', 'twenties']
 id_to_class = {i : cls for i,cls in enumerate(classes)}
@@ -150,15 +153,17 @@ class RTVoice():
                 mel_spec = mel_spec.unsqueeze(0).unsqueeze(0)
 
                 print(mel_spec.shape)
-
+                
+                time_before = time.time()
                 print(id_to_class[network(mel_spec).argmax().item()])
+                print(f"Time taken for inference: {time.time() - time_before} seconds")
 
                 if plot:
                     # Update plots
-                    self.plot_waveform(audio_tensor.numpy(), axs[0])
-                    self.plot_spectrogram(mel_spec.squeeze(), axs[1])
-                    self.plot_pitch(pitch.squeeze().numpy(), axs[2])
-                    self.plot_magnitude(magnitude.squeeze(), axs[3])
+                    self.plot_waveform(audio_tensor.cpu().numpy(), axs[0])
+                    self.plot_spectrogram(mel_spec.cpu().squeeze(), axs[1])
+                    self.plot_pitch(pitch.squeeze().cpu().numpy(), axs[2])
+                    self.plot_magnitude(magnitude.cpu().squeeze(), axs[3])
 
                     plt.tight_layout()
                     plt.pause(0.01)
@@ -258,4 +263,4 @@ if __name__ == "__main__":
     network = NeuralNet.Audio_Transformer(n_mels=59, classes=9, d_model=64, nheads=4, N=6, frame_length=500)
     network.load_state_dict(torch.load("./Max_Accuracy_Model.pth"))
 
-    voice.run_real_time_age_detection(network, True)
+    voice.run_real_time_age_detection(network, False)
