@@ -29,7 +29,7 @@ import psutil
 torch.set_default_device("cuda:0")
 
 PATH = "./cv-corpus-23.0-2025-09-05/en/"
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 TEST_BATCH_SIZE = 32
 EP = 1E-6
 WD = 1E-3
@@ -37,8 +37,8 @@ WD = 1E-3
 BATCHES_PER_TEST = 60
 
 # There are 3 phases of training these define the three learning rates
-LR1 = 1e-5
-LR2 = 3e-4
+LR1 = 3e-5
+LR2 = 1e-5
 LR3 = 1e-5
 
 
@@ -361,6 +361,8 @@ def test_network(network, progress, max_accuracy, ii, loss, phase_num):
 
     progress.update(ii, loss.item(), 100 * correct / total, phase_num)
 
+    torch.save(network.state_dict(), "./Current_Model.pth")
+
     if(100* correct / total > max_accuracy):
         torch.save(network.state_dict(), "./Max_Accuracy_Model.pth")
         max_accuracy = 100* correct / total
@@ -528,12 +530,36 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
             labels = batch[1].to(device).long()
 
             output = model(mel.to(device), batch[2])
-            loss = nn.CrossEntropyLoss()(output, labels) # Gets the mel spectrogram and labels as the index numbers
 
-            optimizer.zero_grad()
+            # === LOGIT SAFETY CHECK ===
+            if not torch.isfinite(output).all():
+                continue
+
+            # === LABEL SAFETY CHECK ===
+            labels = labels.long()
+            if labels.min() < 0 or labels.max() >= output.shape[1]:
+                continue
+
+            loss = nn.CrossEntropyLoss()(output, labels)
+
+            # === LOSS SAFETY CHECK ===
+            if not torch.isfinite(loss):
+                continue
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
+
+            # === GRADIENT SAFETY CHECK ===
+            bad_grad = False
+            for n, p in network.named_parameters():
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                    bad_grad = True
+
+            if bad_grad:
+                optimizer.zero_grad()
+                continue
+
+            torch.nn.utils.clip_grad_norm_(network.parameters(), 5.0)
+            optimizer.step()  
 
             progress.update(ii, loss.item(), None, phase_num)
 
@@ -545,8 +571,8 @@ def train(model : NeuralNet.Audio_Transformer, total_epochs=50, training_log_pat
         
                 
 
-network = NeuralNet.Audio_Transformer(n_mels=59, classes=9, d_model=64, nheads=4, N=6, frame_length=500)
-network.load_state_dict(torch.load("./Max_Accuracy_Model.pth"))
+network = NeuralNet.Audio_Transformer(n_mels=49, classes=9, d_model=32, nheads=4, N=4, frame_length=400, classifier_d=256)
+network.load_state_dict(torch.load("./Current_Model.pth"))
 
 print(f"Total number of parameters: {count_parameters(network, False)}")
 print(f"Transformer number of parameters: {count_parameters(network.encoder, False)}")
@@ -556,5 +582,7 @@ print(f"Convolution second finder of parameters: {count_parameters(network.secon
 voice_data = RTVoiceData.RTVoice(n_mel=n_mel)
 
 training_log = "./training.csv"
+
+# torch.autograd.set_detect_anomaly(True)
 
 train(network, 500, training_log)

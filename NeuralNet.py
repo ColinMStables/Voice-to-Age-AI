@@ -11,9 +11,10 @@ class RL_Second_Finder(nn.Module):
 
     To run on an embedded system this needs to be very small but accurate
     """
-    def __init__(self, n_mel=64, hidden=256):
+    
+    def __init__(self, n_mel=64, hidden=256, min_width=0.05):
         super().__init__()
-
+        self.min_width = float(min_width)
         self.conv = nn.Sequential(
             nn.Conv1d(n_mel, 128, kernel_size=3, padding=1),
             nn.BatchNorm1d(128),
@@ -30,7 +31,6 @@ class RL_Second_Finder(nn.Module):
             nn.ReLU(),
 
             nn.Conv1d(256, 256, kernel_size=3, padding=1),
-            nn.AvgPool1d(2),
             nn.BatchNorm1d(256),
             nn.ReLU(),
 
@@ -47,10 +47,26 @@ class RL_Second_Finder(nn.Module):
 
     def forward(self, x):
         # x: (B, n_mels, time)
-        x = self.conv(x)   # (B, 256, 1)
-        x = self.fc(x)     # (B,2)
-        x = torch.sigmoid(x)
-        return torch.clamp(x, 1e-4, 1 - 1e-4)
+        h = self.conv(x).squeeze(-1)   # (B, 256)
+        out = self.fc(h)               # (B, 2)  raw a, b
+
+        # param -> start in [0, 1-min_width], width >= min_width
+        a = out[:, 0:1]   # (B,1)
+        b = out[:, 1:2]   # (B,1)
+
+        min_w = float(self.min_width)
+        start = torch.sigmoid(a) * (1.0 - min_w)
+        width = F.softplus(b) + min_w   # positive and differentiable
+
+        # compute right; keep numerically safe but differentiable
+        right = start + width
+        # keep within [0,1] but avoid hard zeros: use clamp for numeric safety
+        eps = 1e-6
+        right = torch.clamp(right, min=eps, max=1.0 - eps)
+        start = torch.clamp(start, min=0.0, max=1.0 - min_w - eps)
+
+        # return (start, right) as shape (B,2)
+        return torch.cat([start, right], dim=1)
 
 class Direct_Convolution(nn.Module):
 
@@ -111,7 +127,7 @@ class Audio_Transformer(nn.Module):
         # encoder_layer = nn.TransformerEncoderLayer(d_model, nheads, batch_first=True, dim_feedforward=1024)
         # self.encoder = nn.TransformerEncoder(encoder_layer, N)
 
-        self.encoder = ta.models.Conformer(d_model, nheads, 1024, N, 5, 0.1, True, True)
+        self.encoder = ta.models.Conformer(d_model, nheads, 256, N, 5, 0.1, True, True)
 
         # Here we use the CLS token like bert for classification
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
@@ -128,80 +144,46 @@ class Audio_Transformer(nn.Module):
         )
 
     def crop_mel_spec_dual(self, mel_spec, left_norm, right_norm, lengths=None):
-        """
-        Left and right cropping of padded mel spectrograms that preserves gradients and avoids cropping padded areas
-
-        Args:
-            mel_spec: (B, C, M, T) padded mel spectrogram batch
-            left_norm, right_norm: (B,) floats in [0,1] crop start / end positions
-            lengths: (B,) the mel lengths before padding
-
-        Returns:
-            Cropped mel spectrogram: (B, C, M, frame_length)
-        """
-
+        # mel_spec: (B, C, M, T)
         B, C, M, T = mel_spec.shape
         device = mel_spec.device
         frame_length = self.frame_length
 
-        # The length of the mel spectrograms are padded for batching purposes 
-        # But if we want to crop the spectrograms we don't want to crop into a padded portion so we pass the original lengths
         if lengths is None:
-            lengths = torch.full((B,), T, device=device, dtype=torch.float32)
+            lengths = torch.full((B,), float(T), device=device)
         else:
-            lengths = lengths.to(device, dtype=torch.float32)
+            lengths = lengths.to(device).float()
+        lengths = torch.clamp(lengths, min=1.0)
 
-        # Lengths shouldn't be zero but just in case
-        lengths = torch.clamp(lengths, min=1)
+        # ensure left_norm/right_norm are floats
+        left = left_norm.view(B, 1).to(device).float().clamp(0.0, 1.0)
+        right = right_norm.view(B, 1).to(device).float().clamp(0.0, 1.0)
 
-        # This will be the [0-1] scale of the unpadded mel_spec compared to the full spec
-        scale = (lengths / T).view(B, 1)
+        # scale to real (avoid division by zero)
+        scale = (lengths / max(float(T), 1.0))
+        scale = scale.view(B, 1).clamp(0.0, 1.0)
 
-        # These should already be in the range [0,1], but in case they aren't
-        left = left_norm.clamp(0.0, 1.0)
-
-        # If the right crop is less than the left we pad it to be a little extra
-        right = torch.maximum(right_norm.clamp(0.0, 1.0), left + 1e-5)
-
-        # linspace in [0,1] for output time axis with frame_length divisions
         lin_x = torch.linspace(0.0, 1.0, frame_length, device=device).view(1, frame_length)
+        crop_range = left + lin_x * (right - left)   # (B, frame_length)
+        crop_range = crop_range * scale
 
-        # Base crop range [left, right]
-        crop_range = left.unsqueeze(1) + lin_x * (right - left).unsqueeze(1)  # (B,frame)
-
-        # Adjust so that range never exceeds each sample’s real length
-        # The main issue with this is that it adjusts the left side too but the model should learn around that when cropping
-        crop_range = crop_range * scale  # (B, frame_length)
-
-        #
-        #   This gets everything ready for the grid sampling
-        #
-
-        # Convert to [-1,1] normalized coords for grid sample
         grid_x = crop_range * 2.0 - 1.0
-        grid_x = grid_x.unsqueeze(1).expand(B, M, frame_length)  # (B,M,frame)
+        grid_x = grid_x.unsqueeze(1).expand(B, M, frame_length)   # (B, M, frame_length)
 
-        # We count the bins as the Y axis which should stay the same after cropping
-        # To keep them the same we specify that we want grid_sample to use all the bins
         lin_y = torch.linspace(-1.0, 1.0, M, device=device).view(1, M, 1)
         grid_y = lin_y.expand(B, M, frame_length)
 
-        # Puts them together
-        grid = torch.stack((grid_x, grid_y), dim=-1)  # (B, M, frame, 2)
+        grid = torch.stack((grid_x, grid_y), dim=-1)  # (B, M, frame_length, 2)
 
-        # So grid sample should contain grid_x of a cropped spectrogram by specifying the locations [0.2, 0.21, 0.22 , ...... 0.79, 0.8] for 0.2 left and 0.8 right with full scale
-        # And our grid_y should go from [-1, 1] in mel_bins number of steps to preserve it
-
-        # Grid sample will then interpolate the original mel_spec to a new cropped one, while also preserving the gradients of the left and right
         cropped = F.grid_sample(
             mel_spec,
             grid,
             mode='bilinear',
             padding_mode='zeros',
-            align_corners=True
+            align_corners=False
         )
-
         return cropped
+
 
     
     def plot_cropped_mel(self, mel_spec, cropped):
@@ -236,38 +218,40 @@ class Audio_Transformer(nn.Module):
         plt.ioff()
         plt.show()
 
-    def forward(self, mel_spec: torch.Tensor, lengths = None):
-        """
-        mel_spec: (B, 1, n_mels, time)
-        returns logits: (B, classes)
-        """
-        B, C, M, T = mel_spec.shape
- 
-        x = mel_spec.squeeze(1)  # (B, M, T)
 
-        second = self.second_finder(x)  # (B,2)
-        start_norm, duration_norm = second[:,0], second[:,1]
-        # Cropping using the convolutional layer
+    def forward(self, mel_spec: torch.Tensor, lengths=None):
+        # mel_spec expected: (B, 1, 1, n_mels, time)
 
-        cropped = self.crop_mel_spec_dual(mel_spec, start_norm, duration_norm, lengths=lengths)
+        mel_spec = mel_spec.squeeze(1)
+        mel_spec[:,:,42:47,:] = torch.log1p(mel_spec[:, :, 42:47, :])
+        mel_spec = torch.log1p(mel_spec)
+        mel_spec = torch.nan_to_num(mel_spec, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if(self.debug):
-            # This plots both the mel spectrogram before and after cropping
-            self.plot_cropped_mel(x, cropped)
+        assert mel_spec.dim() == 4, f"mel_spec dim={mel_spec.dim()}"
+        B = mel_spec.size(0)
+        # convert to (B, n_mels, time) for the second finder and conv1d
+        sf_in = mel_spec.squeeze(1)   # (B, n_mels, time)
 
-        #convert to (B, frame_length, n_mels)
-        x = cropped.squeeze(1)
+        # get crop coords (B,2)
+        second = self.second_finder(sf_in)   # (B,2)
+        start_norm, right_norm = second[:, 0], second[:, 1]
 
-        x = self.conv_net(x)
+        # crop (works with original mel_spec shape)
+        cropped = self.crop_mel_spec_dual(mel_spec, start_norm, right_norm, lengths=lengths)  # (B, C, M, frame_length)
 
-        x = x.transpose(1,2) # (B, frame_length, n_mels)
+        # optionally debug
+        if self.debug:
+            self.plot_cropped_mel(sf_in, cropped)
 
-        # embedding
-        x = self.input_embedding(x)  # (B, frame_length, d_model)
+        x = cropped.squeeze(1)  # (B, M, frame_length)
+        x = self.conv_net(x)    # (B, channels, maybe smaller_time)
+        x = x.transpose(1, 2)   # (B, time', channels)
 
-        # CLS token + pos embeddings
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B,1,d)
-        x = torch.cat([cls_tokens, x], dim=1)          # (B, frame_length+1, d)
+        x = self.input_embedding(x)  # (B, time', d_model)
+
+        # cls token and pos
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
 
         pos = self.pos_embedding[:, :x.size(1), :].to(x.device)
         x = x + pos
@@ -275,10 +259,9 @@ class Audio_Transformer(nn.Module):
         x = self.pre_norm(x)
         lens = torch.full((B,), x.size(1), dtype=torch.long, device=x.device)
         x = self.encoder(x, lens)
-        #x = self.encoder(x)             # (B, length+1, d)
 
-        #x = x[0][:, 0, :]
-        x = x[0].mean(dim=1)
-        logits = self.classifier(x)   # (B, classes)
-
+        # pool
+        pooled = x[0][:, 0, :]   # (B, d_model) since CLS will be at index 0
+        logits = self.classifier(pooled)
         return logits
+
