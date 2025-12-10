@@ -12,9 +12,9 @@ class RL_Second_Finder(nn.Module):
     To run on an embedded system this needs to be very small but accurate
     """
     
-    def __init__(self, n_mel=64, hidden=256, min_width=0.05):
+    def __init__(self, n_mel=64, hidden=256):
         super().__init__()
-        self.min_width = float(min_width)
+
         self.conv = nn.Sequential(
             nn.Conv1d(n_mel, 128, kernel_size=3, padding=1),
             nn.BatchNorm1d(128),
@@ -27,10 +27,6 @@ class RL_Second_Finder(nn.Module):
             nn.AvgPool1d(2),
 
             nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-
-            nn.Conv1d(256, 256, kernel_size=3, padding=1),
             nn.BatchNorm1d(256),
             nn.ReLU(),
 
@@ -50,23 +46,46 @@ class RL_Second_Finder(nn.Module):
         h = self.conv(x).squeeze(-1)   # (B, 256)
         out = self.fc(h)               # (B, 2)  raw a, b
 
-        # param -> start in [0, 1-min_width], width >= min_width
-        a = out[:, 0:1]   # (B,1)
-        b = out[:, 1:2]   # (B,1)
+        # return (start, right) as shape (B,2)
+        return out
+    
+class RL_Second_Finder_2D(nn.Module):
+    """
+    Predicts where to crop the left and right sides of a mel spectrogram
 
-        min_w = float(self.min_width)
-        start = torch.sigmoid(a) * (1.0 - min_w)
-        width = F.softplus(b) + min_w   # positive and differentiable
+    To run on an embedded system this needs to be very small but accurate
+    """
+    
+    def __init__(self, n_mel=64, hidden=256):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(n_mel, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.AvgPool2d(2),
 
-        # compute right; keep numerically safe but differentiable
-        right = start + width
-        # keep within [0,1] but avoid hard zeros: use clamp for numeric safety
-        eps = 1e-6
-        right = torch.clamp(right, min=eps, max=1.0 - eps)
-        start = torch.clamp(start, min=0.0, max=1.0 - min_w - eps)
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.AvgPool2d(2),
+
+            nn.AdaptiveAvgPool2d(1),
+        )
+
+        self.fc = nn.Sequential(
+            nn.Flatten(),              
+            nn.Linear(128, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 2)               
+        )
+
+    def forward(self, x):
+        # x: (B, n_mels, time)
+        h = self.conv(x).squeeze(-1)   # (B, 256)
+        out = self.fc(h)               # (B, 2)  raw a, b
 
         # return (start, right) as shape (B,2)
-        return torch.cat([start, right], dim=1)
+        return out
 
 class Direct_Convolution(nn.Module):
 
@@ -95,6 +114,42 @@ class Direct_Convolution(nn.Module):
     def forward(self, x):
         x = self.conv(x)
         return x
+    
+class Direct_Convolution_2D(nn.Module):
+
+    def __init__(self,
+                 n_mel = 64,
+                 d_out = 200
+                 ) -> None:
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(n_mel, 128, kernel_size=3, padding = 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.AvgPool2d(2),
+
+            nn.Conv2d(128, 128, kernel_size=3, padding = 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.AvgPool2d(2),
+
+            nn.Conv2d(128, 128, kernel_size=3, padding = 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.AvgPool2d(2),
+
+            nn.Conv2d(128, 128, kernel_size=3, padding = 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.AvgPool2d(2),
+
+            nn.AdaptiveAvgPool2d((40, d_out)),
+         )
+        
+    def forward(self, x):
+        x = self.conv(x)
+        return x
 
 class Audio_Transformer(nn.Module):
     def __init__(self, 
@@ -104,21 +159,27 @@ class Audio_Transformer(nn.Module):
                  nheads=8,
                  N=6,
                  frame_length=100,
-                 classifier_d = 1024
+                 classifier_d = 1024,
+                 one_d = True
                  ):
         super().__init__()
         self.n_mels = n_mels
         self.d_model = d_model
         self.frame_length = frame_length
-
+        self.one_d = one_d
         self.debug = False
 
-        self.second_finder = RL_Second_Finder(n_mel=n_mels)
+        if(one_d):
+            self.second_finder = RL_Second_Finder(n_mel=n_mels)
 
-        self.conv_net = Direct_Convolution(n_mels)
+            self.input_embedding = nn.Linear(n_mels, d_model)
+        else:
+            self.second_finder = RL_Second_Finder_2D(n_mel=1)
 
-        # 256 for the convolution channels #TODO make variable
-        self.input_embedding = nn.Linear(256, d_model)
+            self.conv_net = Direct_Convolution_2D(1)
+
+            self.input_embedding = nn.Linear(128, d_model)
+
 
         self.max_pos = frame_length + 1 
         self.pos_embedding = nn.Parameter(torch.randn(1, self.max_pos * 4, d_model))
@@ -218,8 +279,7 @@ class Audio_Transformer(nn.Module):
         plt.ioff()
         plt.show()
 
-
-    def forward(self, mel_spec: torch.Tensor, lengths=None):
+    def forward_1D(self, mel_spec: torch.Tensor, lengths = None):
         # mel_spec expected: (B, 1, 1, n_mels, time)
 
         mel_spec = mel_spec.squeeze(1)
@@ -240,12 +300,58 @@ class Audio_Transformer(nn.Module):
         cropped = self.crop_mel_spec_dual(mel_spec, start_norm, right_norm, lengths=lengths)  # (B, C, M, frame_length)
 
         # optionally debug
-        if self.debug:
-            self.plot_cropped_mel(sf_in, cropped)
+        # if self.debug:
+        #     self.plot_cropped_mel(sf_in, cropped)
 
         x = cropped.squeeze(1)  # (B, M, frame_length)
-        x = self.conv_net(x)    # (B, channels, maybe smaller_time)
-        x = x.transpose(1, 2)   # (B, time', channels)
+
+        x = x.transpose(1, 2)   # (B, time, channels)
+
+        x = self.input_embedding(x)  # (B, time, d_model)
+
+        # cls token and pos
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        pos = self.pos_embedding[:, :x.size(1), :].to(x.device)
+        x = x + pos
+
+        x = self.pre_norm(x)
+        lens = torch.full((B,), x.size(1), dtype=torch.long, device=x.device)
+        x = self.encoder(x, lens)
+
+        # pool
+        pooled = x[0][:, 0, :]   # (B, d_model) since CLS will be at index 0
+        logits = self.classifier(pooled)
+        return logits
+
+    def forward_2D(self, mel_spec: torch.Tensor, lengths = None):
+        # mel_spec expected: (B, 1, 1, n_mels, time)
+
+        mel_spec = mel_spec.squeeze(1)
+        mel_spec[:,:,42:47,:] = torch.log1p(mel_spec[:, :, 42:47, :])
+        mel_spec = torch.log1p(mel_spec)
+        mel_spec = torch.nan_to_num(mel_spec, nan=0.0, posinf=0.0, neginf=0.0)
+
+        assert mel_spec.dim() == 4, f"mel_spec dim={mel_spec.dim()}"
+        B = mel_spec.size(0)
+        # convert to (B, n_mels, time) for the second finder and conv1d
+        sf_in = mel_spec # (B, 1, n_mels, time)
+
+        # get crop coords (B,2)
+        second = self.second_finder(sf_in)   # (B,2)
+        start_norm, right_norm = second[:, 0], second[:, 1]
+
+        # crop (works with original mel_spec shape)
+        cropped = self.crop_mel_spec_dual(mel_spec, start_norm, right_norm, lengths=lengths)  # (B, C, M, frame_length)
+
+        # optionally debug
+        # if self.debug:
+        #     self.plot_cropped_mel(sf_in, cropped)
+
+        x = self.conv_net(cropped)
+        x = x.flatten(2)
+        x = x.transpose(1, 2) 
 
         x = self.input_embedding(x)  # (B, time', d_model)
 
@@ -264,4 +370,10 @@ class Audio_Transformer(nn.Module):
         pooled = x[0][:, 0, :]   # (B, d_model) since CLS will be at index 0
         logits = self.classifier(pooled)
         return logits
+
+    def forward(self, mel_spec: torch.Tensor, lengths=None):
+        if(self.one_d):
+            return self.forward_1D(mel_spec, lengths)
+        else:
+            return self.forward_2D(mel_spec, lengths)
 

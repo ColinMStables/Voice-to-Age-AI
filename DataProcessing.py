@@ -175,6 +175,122 @@ class DatasetProcessing():
 
                     with open(self.path + csv_text + "/" + row[7] + "/" + file_name[:-4], "xb") as r:
                         pickle.dump(mel_spec, r)
+
+    def save_mel_c(
+            self,
+            n_mfcc,
+            n_mels,
+            audio,
+            sr
+    ):
+        waveform = torch.tensor(audio).float().unsqueeze(0).cuda()
+        sample_rate = sr
+
+        original_waveform = waveform.clone()
+
+        waveform = remove_silence(waveform, sample_rate, frame_ms=30, hop_ms=10, energy_threshold=1e-4)
+
+        mel_transform = ta.transforms.MFCC(
+            sample_rate=sample_rate,
+            n_mfcc = n_mfcc,
+            log_mels=True,
+            melkwargs={
+            "n_fft" : 1024,
+            "hop_length" : 512,
+            "n_mels" : n_mels,
+            }
+        ).to("cuda:0")
+
+        mel_spec = mel_transform(waveform)
+
+        pitch = ta.functional.detect_pitch_frequency(original_waveform, sample_rate)
+        pitch = pitch.unsqueeze(0)
+        pitch = torch.nn.functional.interpolate(pitch, size=mel_spec.shape[-1], mode="linear", align_corners=False)
+
+        pitch = torch.log1p(pitch)
+
+        window = torch.hann_window(1024, device=waveform.device)
+        stft = torch.stft(
+            waveform,
+            n_fft=1024,
+            hop_length=512,
+            win_length=1024,
+            window=window,
+            return_complex=True
+        )
+
+        magnitude = stft.abs() 
+
+        transform_spectral_centroid = ta.transforms.SpectralCentroid(sample_rate, n_fft=1024,hop_length=512)  # (1, 1, time)
+        spectral_centroid = transform_spectral_centroid(waveform).unsqueeze(0)
+        
+        # magnitude: (channel, freq_bins, time)
+        mag = magnitude + 1e-8  # avoid div by zero
+        freqs = torch.linspace(0, sample_rate/2, mag.shape[1]).to(mag.device)
+
+        # Spectral centroid
+        centroid = torch.sum(freqs[None, :, None] * mag, dim=1) / torch.sum(mag, dim=1)
+
+        # Spectral bandwidth
+        bandwidth = torch.sqrt(
+            torch.sum(((freqs[None, :, None] - centroid[:, None, :])**2) * mag, dim=1) / torch.sum(mag, dim=1)
+        )
+
+        # Spectral rolloff (approximate 85%)
+        cumsum_mag = torch.cumsum(mag, dim=1)
+        rolloff = torch.zeros_like(centroid)
+        threshold = 0.85 * torch.sum(mag, dim=1)
+        for i in range(mag.shape[2]):
+            rolloff[:, i] = freqs[(cumsum_mag[:, :, i] >= threshold[:, i]).nonzero()[0,1]]
+
+        # Spectral flatness
+        flatness = torch.exp(torch.mean(torch.log(mag), dim=1)) / torch.mean(mag, dim=1)
+
+
+        frame_len = int(0.025 * sample_rate)
+        hop_len   = int(0.010 * sample_rate)
+
+        frames = waveform.squeeze(0).cpu().unfold(0, frame_len, hop_len)
+        formants_list = []
+        for frame in frames:
+            f = get_formants(frame.unsqueeze(0), sample_rate)
+            formants_list.append(f)
+        formants_tensor = torch.tensor(np.array(formants_list).T, dtype=torch.float32)  # shape: (3, num_frames)
+        #interpolate to match MFCC time dimension
+        formants_tensor = torch.nn.functional.interpolate(
+            formants_tensor.unsqueeze(0), size=mel_spec.shape[-1], mode="linear", align_corners=False
+        )
+
+        formants_tensor = torch.log1p(formants_tensor)
+
+        pitch_diff = torch.abs(pitch[:, :, 1:] - pitch[:, :, :-1])
+        jitter = torch.mean(pitch_diff, dim=-1, keepdim=True)
+        jitter = torch.nn.functional.interpolate(jitter, size=mel_spec.shape[-1], mode="linear")
+
+        harmonic_energy = mag[:, :20].mean(dim=1, keepdim=True)
+        noise_energy = mag[:, 20:].mean(dim=1, keepdim=True)
+        hnr = harmonic_energy / (noise_energy + 1e-6)
+        hnr = torch.log1p(hnr)
+
+        voiced = (pitch > 0).float()
+        speech_rate = voiced.mean(dim=-1, keepdim=True)
+        speech_rate = torch.nn.functional.interpolate(speech_rate, size=mel_spec.shape[-1], mode="linear")
+        mel_spec = torch.cat([mel_spec, speech_rate], dim=1)
+
+
+        mel_spec = torch.cat([mel_spec, pitch], dim=1)
+        mel_spec = torch.cat([mel_spec, spectral_centroid], dim=1)
+        mel_spec = torch.cat([mel_spec, centroid.unsqueeze(0)], dim=1)
+        mel_spec = torch.cat([mel_spec, bandwidth.unsqueeze(0)], dim=1)
+        mel_spec = torch.cat([mel_spec, rolloff.unsqueeze(0)], dim=1)
+        mel_spec = torch.cat([mel_spec, flatness.unsqueeze(0)], dim=1)
+        mel_spec = torch.cat([mel_spec, jitter], dim=1)
+        mel_spec = torch.cat([mel_spec, hnr], dim=1)
+
+        
+        mel_spec = mel_spec.unsqueeze(0) # B, C, Bins, Time
+
+        return mel_spec
     
     def create_mel_c(
             self,
@@ -226,134 +342,29 @@ class DatasetProcessing():
                         continue
 
                     audio, sr = sf.read(self.path + "clips/" + file_name)
-                    waveform = torch.tensor(audio).float().unsqueeze(0).cuda()
-                    sample_rate = sr
-
-                    original_waveform = waveform.clone()
-
-                    waveform = remove_silence(waveform, sample_rate, frame_ms=30, hop_ms=10, energy_threshold=1e-4)
-
-                    mel_transform = ta.transforms.MFCC(
-                        sample_rate=sample_rate,
-                        n_mfcc = n_mfcc,
-                        log_mels=True,
-                        melkwargs={
-                        "n_fft" : 1024,
-                        "hop_length" : 512,
-                        "n_mels" : n_mels,
-                        }
-                    ).to("cuda:0")
-
-                    mel_spec = mel_transform(waveform)
-
-                    pitch = ta.functional.detect_pitch_frequency(original_waveform, sample_rate)
-                    pitch = pitch.unsqueeze(0)
-                    pitch = torch.nn.functional.interpolate(pitch, size=mel_spec.shape[-1], mode="linear", align_corners=False)
-
-                    pitch = torch.log1p(pitch)
-
-                    window = torch.hann_window(1024, device=waveform.device)
-                    stft = torch.stft(
-                        waveform,
-                        n_fft=1024,
-                        hop_length=512,
-                        win_length=1024,
-                        window=window,
-                        return_complex=True
-                    )
-
-                    magnitude = stft.abs() 
-
-                    transform_spectral_centroid = ta.transforms.SpectralCentroid(sample_rate, n_fft=1024,hop_length=512)  # (1, 1, time)
-                    spectral_centroid = transform_spectral_centroid(waveform).unsqueeze(0)
-                    
-                    # magnitude: (channel, freq_bins, time)
-                    mag = magnitude + 1e-8  # avoid div by zero
-                    freqs = torch.linspace(0, sample_rate/2, mag.shape[1]).to(mag.device)
-
-                    # Spectral centroid
-                    centroid = torch.sum(freqs[None, :, None] * mag, dim=1) / torch.sum(mag, dim=1)
-
-                    # Spectral bandwidth
-                    bandwidth = torch.sqrt(
-                        torch.sum(((freqs[None, :, None] - centroid[:, None, :])**2) * mag, dim=1) / torch.sum(mag, dim=1)
-                    )
-
-                    # Spectral rolloff (approximate 85%)
-                    cumsum_mag = torch.cumsum(mag, dim=1)
-                    rolloff = torch.zeros_like(centroid)
-                    threshold = 0.85 * torch.sum(mag, dim=1)
-                    for i in range(mag.shape[2]):
-                        rolloff[:, i] = freqs[(cumsum_mag[:, :, i] >= threshold[:, i]).nonzero()[0,1]]
-
-                    # Spectral flatness
-                    flatness = torch.exp(torch.mean(torch.log(mag), dim=1)) / torch.mean(mag, dim=1)
-
-
-                    frame_len = int(0.025 * sample_rate)
-                    hop_len   = int(0.010 * sample_rate)
-
-                    frames = waveform.squeeze(0).cpu().unfold(0, frame_len, hop_len)
-                    formants_list = []
-                    for frame in frames:
-                        f = get_formants(frame.unsqueeze(0), sample_rate)
-                        formants_list.append(f)
-                    formants_tensor = torch.tensor(np.array(formants_list).T, dtype=torch.float32)  # shape: (3, num_frames)
-                    #interpolate to match MFCC time dimension
-                    formants_tensor = torch.nn.functional.interpolate(
-                        formants_tensor.unsqueeze(0), size=mel_spec.shape[-1], mode="linear", align_corners=False
-                    )
-
-                    formants_tensor = torch.log1p(formants_tensor)
-
-                    pitch_diff = torch.abs(pitch[:, :, 1:] - pitch[:, :, :-1])
-                    jitter = torch.mean(pitch_diff, dim=-1, keepdim=True)
-                    jitter = torch.nn.functional.interpolate(jitter, size=mel_spec.shape[-1], mode="linear")
-
-                    harmonic_energy = mag[:, :20].mean(dim=1, keepdim=True)
-                    noise_energy = mag[:, 20:].mean(dim=1, keepdim=True)
-                    hnr = harmonic_energy / (noise_energy + 1e-6)
-                    hnr = torch.log1p(hnr)
-
-                    voiced = (pitch > 0).float()
-                    speech_rate = voiced.mean(dim=-1, keepdim=True)
-                    speech_rate = torch.nn.functional.interpolate(speech_rate, size=mel_spec.shape[-1], mode="linear")
-                    mel_spec = torch.cat([mel_spec, speech_rate], dim=1)
-
-
-                    mel_spec = torch.cat([mel_spec, pitch], dim=1)
-                    mel_spec = torch.cat([mel_spec, spectral_centroid], dim=1)
-                    mel_spec = torch.cat([mel_spec, centroid.unsqueeze(0)], dim=1)
-                    mel_spec = torch.cat([mel_spec, bandwidth.unsqueeze(0)], dim=1)
-                    mel_spec = torch.cat([mel_spec, rolloff.unsqueeze(0)], dim=1)
-                    mel_spec = torch.cat([mel_spec, flatness.unsqueeze(0)], dim=1)
-                    mel_spec = torch.cat([mel_spec, jitter], dim=1)
-                    mel_spec = torch.cat([mel_spec, hnr], dim=1)
-
-                    
-                    mel_spec = mel_spec.unsqueeze(0) # B, C, Bins, Time
+                    mel_spec = self.save_mel_c( n_mfcc, n_mels, audio, sr)
 
                     with open(self.path + csv_text + name + "/" + row[7] + "/" + file_name[:-4], "xb") as r:
                         pickle.dump(mel_spec, r)
 
 def make_mfcc_output(number):
-    d = DatasetProcessing(PATH, number, multiprocessing.cpu_count())
+    d = DatasetProcessing(PATH, number, multiprocessing.cpu_count()//2)
     d.create_mel_c("test", 64, 40, "_data")
     d.create_mel_c("train", 64, 40, "_data")
 
 if __name__ == "__main__":
 
-    p = [multiprocessing.Process(target=make_mfcc_output, args=[i]) for i in range(multiprocessing.cpu_count())]
+    p = [multiprocessing.Process(target=make_mfcc_output, args=[i]) for i in range(multiprocessing.cpu_count()//2)]
 
     print(f"Starting {multiprocessing.cpu_count()} processes")
 
     for ii, processes in enumerate(p):
-        if(psutil.virtual_memory().available > 4*(1024)**3):
+        if(psutil.virtual_memory().available > 6*(1024)**3):
             processes.start()
             print(f"Process {ii} started")
             time.sleep(5)
         else:
-            while(psutil.virtual_memory().available < 4*(1024)**3):
+            while(psutil.virtual_memory().available < 6*(1024)**3):
                 time.sleep(1)
             processes.start()
             print(f"Process {ii} started")
